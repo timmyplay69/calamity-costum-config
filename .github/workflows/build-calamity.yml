@@ -1,0 +1,430 @@
+name: Build Calamity Spacewar (USB ACM + Ext WiFi)
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Branch repo Calamity (kosongkan untuk branch default)'
+        required: false
+        default: ''
+      include_rtl8812au:
+        description: 'Sertakan out-of-tree driver Realtek RTL8812AU/88XXAU'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+jobs:
+  build-kernel:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: 1. Persiapan Dependencies & Ruang Disk
+        run: |
+          sudo rm -rf /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc bison build-essential ccache cpio curl device-tree-compiler \
+            flex git libelf-dev libncurses5-dev libssl-dev lld llvm clang \
+            lz4 python3 python-is-python3 rsync unzip wget xz-utils zip zstd \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi binutils-aarch64-linux-gnu
+
+      - name: 2. Download Toolchain Clang (ZyC Clang)
+        run: |
+          mkdir -p "$HOME/clang"
+          CLANG_URL=$(curl -s https://api.github.com/repos/ZyCromerZ/Clang/releases/latest \
+            | grep "browser_download_url.*tar.gz" | cut -d '"' -f 4 | head -n 1)
+          if [ -n "$CLANG_URL" ]; then
+            echo "Downloading Clang from: $CLANG_URL"
+            wget -q "$CLANG_URL" -O clang.tar.gz
+            tar -xzf clang.tar.gz -C "$HOME/clang"
+            rm -f clang.tar.gz
+          else
+            echo "Fallback ke System Clang/LLVM"
+          fi
+
+      - name: 3. Clone Source BruxinCore/CalamityKernel-spacewar
+        run: |
+          if [ -n "${{ github.event.inputs.branch }}" ]; then
+            git clone --depth=1 --recurse-submodules -b "${{ github.event.inputs.branch }}" \
+              https://github.com/BruxinCore/CalamityKernel-spacewar.git kernel
+          else
+            git clone --depth=1 --recurse-submodules \
+              https://github.com/BruxinCore/CalamityKernel-spacewar.git kernel
+          fi
+
+          cd kernel
+          # Pastikan KernelSU submodule terisi jika repo memakai submodule KSU
+          git submodule update --init --recursive || true
+
+      - name: 4. Deteksi Defconfig & Suntik Modul Baru (Tanpa Ubah Config Lama)
+        id: inject
+        working-directory: kernel
+        run: |
+          set -e
+
+          # A. Cari defconfig yang dipakai oleh repo secara otomatis
+          DETECTED_DEFCONFIG=""
+          for f in $(find . -maxdepth 3 \( -name "*.sh" -o -path "./.github/workflows/*.yml" -o -name "build.config*" \) 2>/dev/null); do
+            match=$(grep -oE "(vendor/)?[a-zA-Z0-9_-]+_defconfig" "$f" | head -n 1 || true)
+            if [ -n "$match" ] && [ -f "arch/arm64/configs/$match" ]; then
+              DETECTED_DEFCONFIG="$match"
+              break
+            fi
+          done
+
+          if [ -z "$DETECTED_DEFCONFIG" ]; then
+            for candidate in \
+              "vendor/spacewar_defconfig" \
+              "spacewar_defconfig" \
+              "vendor/calamity_defconfig" \
+              "calamity_defconfig" \
+              "vendor/yupik-perf_defconfig" \
+              "vendor/lahaina-qgki_defconfig" \
+              "lahaina-qgki_defconfig"; do
+              if [ -f "arch/arm64/configs/$candidate" ]; then
+                DETECTED_DEFCONFIG="$candidate"
+                break
+              fi
+            done
+          fi
+
+          if [ -z "$DETECTED_DEFCONFIG" ]; then
+            echo "ERROR: Defconfig tidak ditemukan!"
+            ls -la arch/arm64/configs/ arch/arm64/configs/vendor/ || true
+            exit 1
+          fi
+
+          DEFCONFIG_PATH="arch/arm64/configs/$DETECTED_DEFCONFIG"
+          echo "Target Defconfig Terdeteksi: $DEFCONFIG_PATH"
+          echo "defconfig=$DETECTED_DEFCONFIG" >> $GITHUB_OUTPUT
+
+          # B. Fungsi Injeksi Non-Destruktif (SKIP jika sudah =y atau =m)
+          add_missing_module() {
+              local cfg="$1"
+              local file="$2"
+              if grep -qE "^${cfg}=(y|m)" "$file"; then
+                  echo "[SKIP] $cfg sudah aktif ($(grep -E "^${cfg}=" "$file" | tail -n 1)), tidak diubah."
+              elif grep -qE "^# ${cfg} is not set" "$file"; then
+                  sed -i "s|^# ${cfg} is not set|${cfg}=y|g" "$file"
+                  echo "[ENABLED] $cfg diaktifkan (sebelumnya is not set)."
+              else
+                  echo "${cfg}=y" >> "$file"
+                  echo "[ADDED] $cfg ditambahkan baru."
+              fi
+          }
+
+          # C. Daftar lengkap modul USB CDC ACM, Serial & Wi-Fi USB Eksternal
+          MODULES_TO_ADD=(
+              # 1. USB CDC ACM & USB Serial Converters
+              "CONFIG_USB_ACM"
+              "CONFIG_USB_SERIAL"
+              "CONFIG_USB_SERIAL_GENERIC"
+              "CONFIG_USB_SERIAL_CH341"
+              "CONFIG_USB_SERIAL_CP210X"
+              "CONFIG_USB_SERIAL_FTDI_SIO"
+              "CONFIG_USB_SERIAL_PL2303"
+
+              # 2. USB Network / Tethering Helpers
+              "CONFIG_USB_NET_DRIVERS"
+              "CONFIG_USB_RTL8152"
+              "CONFIG_USB_USBNET"
+              "CONFIG_USB_NET_CDCETHER"
+              "CONFIG_USB_NET_CDC_NCM"
+              "CONFIG_USB_NET_RNDIS_HOST"
+
+              # 3. Core Wireless Stack (mac80211 untuk dongle USB)
+              "CONFIG_WLAN"
+              "CONFIG_WIRELESS"
+              "CONFIG_CFG80211"
+              "CONFIG_CFG80211_WEXT"
+              "CONFIG_MAC80211"
+              "CONFIG_MAC80211_HAS_RC"
+              "CONFIG_MAC80211_RC_MINSTREL"
+              "CONFIG_MAC80211_RC_DEFAULT_MINSTREL"
+              "CONFIG_MAC80211_MESH"
+
+              # 4. Atheros USB (AR9271 / TP-Link TL-WN722N v1 / Alfa AWUS036NHA)
+              "CONFIG_WLAN_VENDOR_ATH"
+              "CONFIG_ATH_COMMON"
+              "CONFIG_ATH_CARDS"
+              "CONFIG_ATH9K_HW"
+              "CONFIG_ATH9K_COMMON"
+              "CONFIG_ATH9K_HTC"
+              "CONFIG_CARL9170"
+              "CONFIG_ATH10K"
+              "CONFIG_ATH10K_USB"
+
+              # 5. Ralink USB (RT3070 / RT3572 / RT5370 / Alfa AWUS036NH)
+              "CONFIG_WLAN_VENDOR_RALINK"
+              "CONFIG_RT2X00"
+              "CONFIG_RT2500USB"
+              "CONFIG_RT73USB"
+              "CONFIG_RT2800USB"
+              "CONFIG_RT2800USB_RT33XX"
+              "CONFIG_RT2800USB_RT35XX"
+              "CONFIG_RT2800USB_RT3573"
+              "CONFIG_RT2800USB_RT53XX"
+              "CONFIG_RT2800USB_RT55XX"
+              "CONFIG_RT2800USB_UNKNOWN"
+
+              # 6. MediaTek USB (MT7601U / MT7610U / MT7612U Dual-Band)
+              "CONFIG_WLAN_VENDOR_MEDIATEK"
+              "CONFIG_MT7601U"
+              "CONFIG_MT76_CORE"
+              "CONFIG_MT76_USB"
+              "CONFIG_MT76x02_LIB"
+              "CONFIG_MT76x02_USB"
+              "CONFIG_MT76x0_COMMON"
+              "CONFIG_MT76x0U"
+              "CONFIG_MT76x2_COMMON"
+              "CONFIG_MT76x2U"
+
+              # 7. Realtek USB In-Tree (RTL8187 / RTL8192CU / RTL8XXXU / RTL8188EU)
+              "CONFIG_WLAN_VENDOR_REALTEK"
+              "CONFIG_EEPROM_93CX6"
+              "CONFIG_RTL8187"
+              "CONFIG_RTL_CARDS"
+              "CONFIG_RTLWIFI"
+              "CONFIG_RTLWIFI_USB"
+              "CONFIG_RTL8192C_COMMON"
+              "CONFIG_RTL8192CU"
+              "CONFIG_RTL8XXXU"
+              "CONFIG_RTL8XXXU_UNTESTED"
+              "CONFIG_STAGING"
+              "CONFIG_R8188EU"
+              "CONFIG_88EU_AP_MODE"
+              "CONFIG_R8712U"
+          )
+
+          # D. Simpan daftar fungsi untuk dipanggil ulang saat tahap finalisasi .config
+          declare -p MODULES_TO_ADD > /tmp/modules_list.sh
+          declare -f add_missing_module >> /tmp/modules_list.sh
+
+          # E. Terapkan ke file defconfig tanpa menyentuh config yang sudah aktif
+          for mod in "${MODULES_TO_ADD[@]}"; do
+              add_missing_module "$mod" "$DEFCONFIG_PATH"
+          done
+
+          # Jika ada fragment config khusus spacewar, terapkan juga secara non-destruktif
+          for frag in arch/arm64/configs/vendor/*spacewar*.config; do
+              if [ -f "$frag" ]; then
+                  echo "Menerapkan juga pada fragment: $frag"
+                  for mod in "${MODULES_TO_ADD[@]}"; do
+                      add_missing_module "$mod" "$frag"
+                  done
+              fi
+          done
+
+          git diff "$DEFCONFIG_PATH" > /tmp/defconfig.diff || true
+
+      - name: 5. Suntik Out-of-Tree RTL8812AU (Opsional dengan Backup)
+        if: ${{ github.event.inputs.include_rtl8812au != 'false' }}
+        working-directory: kernel
+        run: |
+          if [ ! -d "drivers/net/wireless/realtek/rtl8812au" ]; then
+            cp drivers/net/wireless/realtek/Makefile /tmp/realtek_Makefile.bak
+            cp drivers/net/wireless/realtek/Kconfig /tmp/realtek_Kconfig.bak
+
+            git clone --depth=1 -b v5.6.4.2 https://github.com/kimocoder/rtl8812au.git \
+              drivers/net/wireless/realtek/rtl8812au || \
+            git clone --depth=1 https://github.com/kimocoder/rtl8812au.git \
+              drivers/net/wireless/realtek/rtl8812au
+
+            # Matikan -Werror di Makefile rtl8812au agar tidak rewel di Clang baru
+            sed -i 's/-Werror//g' drivers/net/wireless/realtek/rtl8812au/Makefile || true
+            echo "ccflags-y += -Wno-error -Wno-enum-conversion -Wno-fortify-source" >> \
+              drivers/net/wireless/realtek/rtl8812au/Makefile
+
+            if ! grep -q "rtl8812au" drivers/net/wireless/realtek/Makefile; then
+              echo 'obj-$(CONFIG_88XXAU) += rtl8812au/' >> drivers/net/wireless/realtek/Makefile
+            fi
+
+            if ! grep -q "rtl8812au/Kconfig" drivers/net/wireless/realtek/Kconfig; then
+              sed -i '/endif/i source "drivers/net/wireless/realtek/rtl8812au/Kconfig"' \
+                drivers/net/wireless/realtek/Kconfig
+            fi
+
+            echo "CONFIG_88XXAU=y" >> "arch/arm64/configs/${{ steps.inject.outputs.defconfig }}"
+          fi
+
+      - name: 6. Generate .config (2-Pass Dependency Unlock + Kunci Config Asli)
+        working-directory: kernel
+        run: |
+          set -e
+          if [ -d "$HOME/clang/bin" ]; then
+            export PATH="$HOME/clang/bin:$PATH"
+          fi
+
+          MAKE_ARGS=(
+            O=out
+            ARCH=arm64
+            SUBARCH=arm64
+            CC=clang
+            LD=ld.lld
+            AR=llvm-ar
+            NM=llvm-nm
+            OBJCOPY=llvm-objcopy
+            OBJDUMP=llvm-objdump
+            STRIP=llvm-strip
+            CROSS_COMPILE=aarch64-linux-gnu-
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+            CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
+            LLVM=1
+            LLVM_IAS=1
+          )
+
+          # 1. Buat baseline config asli untuk mengunci semua =y dan =m bawaan Calamity
+          git checkout -- "arch/arm64/configs/${{ steps.inject.outputs.defconfig }}"
+          make "${MAKE_ARGS[@]}" "${{ steps.inject.outputs.defconfig }}"
+          grep -E "^CONFIG_[A-Za-z0-9_]+=(y|m)$" out/.config | sort -u > /tmp/original_enabled.txt
+          echo "Total config aktif (=y/=m) bawaan Calamity yang dikunci: $(wc -l < /tmp/original_enabled.txt)"
+
+          # 2. Terapkan kembali patch defconfig & jalankan 2-pass olddefconfig
+          source /tmp/modules_list.sh
+          for mod in "${MODULES_TO_ADD[@]}"; do
+              add_missing_module "$mod" "arch/arm64/configs/${{ steps.inject.outputs.defconfig }}"
+              add_missing_module "$mod" "out/.config"
+          done
+          if [ -d "drivers/net/wireless/realtek/rtl8812au" ]; then
+              add_missing_module "CONFIG_88XXAU" "out/.config"
+          fi
+
+          make "${MAKE_ARGS[@]}" olddefconfig
+
+          # Pass ke-2 pada out/.config untuk membuka sub-driver yang baru terbuka setelah gerbang vendor aktif
+          for mod in "${MODULES_TO_ADD[@]}"; do
+              add_missing_module "$mod" "out/.config"
+          done
+          if [ -d "drivers/net/wireless/realtek/rtl8812au" ]; then
+              add_missing_module "CONFIG_88XXAU" "out/.config"
+          fi
+
+          # 3. Verifikasi & Kunci: Pastikan tidak ada 1 pun config =y/=m asli Calamity yang berubah
+          while IFS= read -r line; do
+            cfg_name="${line%%=*}"
+            if ! grep -q "^${line}$" out/.config; then
+              if grep -qE "^(${cfg_name}=|# ${cfg_name} is not set)" out/.config; then
+                sed -i "s|^${cfg_name}=.*|${line}|; s|^# ${cfg_name} is not set|${line}|" out/.config
+              else
+                echo "${line}" >> out/.config
+              fi
+            fi
+          done < /tmp/original_enabled.txt
+
+          make "${MAKE_ARGS[@]}" olddefconfig
+
+          echo "=== VERIFIKASI MODUL DI FINAL out/.config ==="
+          grep -E "CONFIG_(USB_ACM|MAC80211|ATH9K_HTC|RT2800USB|MT7601U|MT76x2U|RTL8187|RTL8192CU|RTL8XXXU|R8188EU|88XXAU|KSU)=" out/.config || true
+
+      - name: 7. Compile Kernel Spacewar
+        working-directory: kernel
+        run: |
+          if [ -d "$HOME/clang/bin" ]; then
+            export PATH="$HOME/clang/bin:$PATH"
+          fi
+
+          MAKE_ARGS=(
+            O=out
+            ARCH=arm64
+            SUBARCH=arm64
+            CC=clang
+            HOSTCC=clang
+            HOSTCXX=clang++
+            LD=ld.lld
+            AR=llvm-ar
+            NM=llvm-nm
+            OBJCOPY=llvm-objcopy
+            OBJDUMP=llvm-objdump
+            STRIP=llvm-strip
+            CROSS_COMPILE=aarch64-linux-gnu-
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+            CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
+            LLVM=1
+            LLVM_IAS=1
+            KCFLAGS="-Wno-error"
+          )
+
+          # Compile dengan auto-fallback jika out-of-tree rtl8812au bermasalah
+          if ! make -j$(nproc --all) "${MAKE_ARGS[@]}"; then
+            if [ -d "drivers/net/wireless/realtek/rtl8812au" ]; then
+              echo "Out-of-tree rtl8812au gagal dikompilasi, melakukan fallback ke in-tree drivers..."
+              rm -rf drivers/net/wireless/realtek/rtl8812au
+              cp /tmp/realtek_Makefile.bak drivers/net/wireless/realtek/Makefile
+              cp /tmp/realtek_Kconfig.bak drivers/net/wireless/realtek/Kconfig
+              sed -i '/CONFIG_88XXAU/d' out/.config
+              make "${MAKE_ARGS[@]}" olddefconfig
+              make -j$(nproc --all) "${MAKE_ARGS[@]}"
+            else
+              exit 1
+            fi
+          fi
+
+      - name: 8. Package Flashable AnyKernel3 Zip
+        working-directory: kernel
+        run: |
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
+          rm -rf AnyKernel3/.git AnyKernel3/modules AnyKernel3/patch AnyKernel3/ramdisk
+
+          cat << 'EOF' > AnyKernel3/anykernel.sh
+          # AnyKernel3 Ramdisk Mod Script
+          properties() { '
+          kernel.string=Calamity Caly-Tachyon (USB-ACM + Ext-WiFi)
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=1
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=spacewar
+          device.name2=Spacewar
+          device.name3=Nothing Phone (1)
+          supported.versions=14-16
+          '; }
+
+          block=/dev/block/bootdevice/by-name/boot;
+          is_slot_device=1;
+          ramdisk_compression=auto;
+          patch_vbmeta_flag=auto;
+
+          . tools/ak3-core.sh;
+          split_boot;
+          flash_boot;
+          EOF
+
+          # Salin Image.gz atau Image
+          if [ -f "out/arch/arm64/boot/Image.gz" ]; then
+            cp out/arch/arm64/boot/Image.gz AnyKernel3/
+          elif [ -f "out/arch/arm64/boot/Image" ]; then
+            cp out/arch/arm64/boot/Image AnyKernel3/
+          else
+            echo "ERROR: Kernel Image tidak ditemukan!"
+            exit 1
+          fi
+
+          # Gabungkan DTB jika ter-generate
+          if compgen -G "out/arch/arm64/boot/dts/vendor/qcom/*.dtb" > /dev/null; then
+            cat out/arch/arm64/boot/dts/vendor/qcom/*.dtb > AnyKernel3/dtb
+          fi
+
+          # Salin dtbo.img jika ter-generate
+          if [ -f "out/arch/arm64/boot/dtbo.img" ]; then
+            cp out/arch/arm64/boot/dtbo.img AnyKernel3/
+          fi
+
+          cd AnyKernel3
+          ZIP_NAME="Calamity-Tachyon-Spacewar-USB_WiFi-$(date +%Y%m%d).zip"
+          zip -r9 "../$ZIP_NAME" * -x .git README.md *placeholder
+          cd ..
+
+          mkdir -p artifacts
+          mv "$ZIP_NAME" artifacts/
+          cp out/.config artifacts/final_kernel.config
+          cp /tmp/defconfig.diff artifacts/defconfig.diff || true
+
+      - name: 9. Upload Flashable Zip & Config Diff
+        uses: actions/upload-artifact@v4
+        with:
+          name: Calamity-Spacewar-Flashable-Kernel
+          path: kernel/artifacts/*
+          

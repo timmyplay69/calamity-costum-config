@@ -21,15 +21,25 @@ jobs:
             rm -f clang.tar.gz
           fi
 
-      - name: 3. Clone Source CalamityKernel-spacewar (With Auth Token)
+      - name: 3. Clone Source Calamity (Safe Submodule Purge)
         env:
           GH_TOKEN: ${{ secrets.MY_GITHUB_TOKEN }}
         run: |
           if [ -n "$GH_TOKEN" ]; then
             git config --global url."https://${GH_TOKEN}@github.com/".insteadOf "https://github.com/"
           fi
-          git clone --depth=1 --recurse-submodules https://github.com/BruxinCore/CalamityKernel-spacewar.git kernel
+          # Jangan pakai --recurse-submodules di awal agar tidak langsung error di zerofrip
+          git clone --depth=1 https://github.com/BruxinCore/CalamityKernel-spacewar.git kernel
           cd kernel
+          
+          # Hapus total konfigurasi submodule KernelSU-Next yang sudah mati/tidak ditemukan
+          git submodule deinit -f KernelSU-Next || true
+          rm -rf .git/modules/KernelSU-Next KernelSU-Next || true
+          if [ -f .gitmodules ]; then
+            git config -f .gitmodules --remove-section submodule.KernelSU-Next || true
+          fi
+          
+          # Update submodule lain yang masih aktif jika ada
           git submodule update --init --recursive || true
 
       - name: 4. Deteksi Defconfig dan Tambah Modul Baru
@@ -62,10 +72,10 @@ jobs:
           add_missing_module() {
             local cfg="$1"
             local file="$2"
-            if grep -qE "^${cfg}=(y\vert{}m)" "$file"; then
+            if grep -qE "^${cfg}=(y|m)" "$file"; then
               echo "[SKIP] $cfg sudah aktif, tidak diubah."
             elif grep -qE "^# ${cfg} is not set" "$file"; then
-              sed -i "s|^# ${cfg} is not set|${cfg}=y\vert{}g" "$file"
+              sed -i "s|^# ${cfg} is not set|${cfg}=y|g" "$file"
               echo "[ENABLED] $cfg diaktifkan."
             else
               echo "${cfg}=y" >> "$file"
@@ -109,5 +119,151 @@ jobs:
             "CONFIG_RT2500USB"
             "CONFIG_RT73USB"
             "CONFIG_RT2800USB"
-            "CONFIG_RT2800USB_RT
-            
+            "CONFIG_RT2800USB_RT33XX"
+            "CONFIG_RT2800USB_RT35XX"
+            "CONFIG_RT2800USB_RT3573"
+            "CONFIG_RT2800USB_RT53XX"
+            "CONFIG_RT2800USB_RT55XX"
+            "CONFIG_RT2800USB_UNKNOWN"
+            "CONFIG_WLAN_VENDOR_MEDIATEK"
+            "CONFIG_MT7601U"
+            "CONFIG_MT76_CORE"
+            "CONFIG_MT76_USB"
+            "CONFIG_MT76x02_LIB"
+            "CONFIG_MT76x02_USB"
+            "CONFIG_MT76x0_COMMON"
+            "CONFIG_MT76x0U"
+            "CONFIG_MT76x2_COMMON"
+            "CONFIG_MT76x2U"
+            "CONFIG_WLAN_VENDOR_REALTEK"
+            "CONFIG_EEPROM_93CX6"
+            "CONFIG_RTL8187"
+            "CONFIG_RTL_CARDS"
+            "CONFIG_RTLWIFI"
+            "CONFIG_RTLWIFI_USB"
+            "CONFIG_RTL8192C_COMMON"
+            "CONFIG_RTL8192CU"
+            "CONFIG_RTL8XXXU"
+            "CONFIG_RTL8XXXU_UNTESTED"
+            "CONFIG_STAGING"
+            "CONFIG_R8188EU"
+            "CONFIG_88EU_AP_MODE"
+            "CONFIG_R8712U"
+          )
+          declare -p MODULES_TO_ADD > /tmp/modules_list.sh
+          declare -f add_missing_module >> /tmp/modules_list.sh
+          for mod in "${MODULES_TO_ADD[@]}"; do
+            add_missing_module "$mod" "$DEFCONFIG_PATH"
+          done
+          git diff "$DEFCONFIG_PATH" > /tmp/defconfig.diff || true
+
+      - name: 5. Suntik Driver RTL8812AU
+        working-directory: kernel
+        run: |
+          if [ ! -d "drivers/net/wireless/realtek/rtl8812au" ]; then
+            cp drivers/net/wireless/realtek/Makefile /tmp/realtek_Makefile.bak
+            cp drivers/net/wireless/realtek/Kconfig /tmp/realtek_Kconfig.bak
+            git clone --depth=1 -b v5.6.4.2 https://github.com/kimocoder/rtl8812au.git drivers/net/wireless/realtek/rtl8812au || git clone --depth=1 https://github.com/kimocoder/rtl8812au.git drivers/net/wireless/realtek/rtl8812au
+            sed -i 's/-Werror//g' drivers/net/wireless/realtek/rtl8812au/Makefile || true
+            echo "ccflags-y += -Wno-error -Wno-enum-conversion -Wno-fortify-source" >> drivers/net/wireless/realtek/rtl8812au/Makefile
+            if ! grep -q "rtl8812au" drivers/net/wireless/realtek/Makefile; then
+              echo 'obj-$(CONFIG_88XXAU) += rtl8812au/' >> drivers/net/wireless/realtek/Makefile
+            fi
+            if ! grep -q "rtl8812au/Kconfig" drivers/net/wireless/realtek/Kconfig; then
+              sed -i '/endif/i source "drivers/net/wireless/realtek/rtl8812au/Kconfig"' drivers/net/wireless/realtek/Kconfig
+            fi
+            echo "CONFIG_88XXAU=y" >> "arch/arm64/configs/${{ steps.inject.outputs.defconfig }}"
+          fi
+
+      - name: 6. Generate Config dan Kunci Config Asli Calamity
+        working-directory: kernel
+        run: |
+          set -e
+          if [ -d "$HOME/clang/bin" ]; then
+            export PATH="$HOME/clang/bin:$PATH"
+          fi
+          MAKE_ARGS=(O=out ARCH=arm64 SUBARCH=arm64 CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- CROSS_COMPILE_COMPAT=arm-linux-gnueabi- LLVM=1 LLVM_IAS=1)
+          git checkout -- "arch/arm64/configs/${{ steps.inject.outputs.defconfig }}"
+          make "${MAKE_ARGS[@]}" "${{ steps.inject.outputs.defconfig }}"
+          grep -E "^CONFIG_[A-Za-z0-9_]+=(y|m)$" out/.config | sort -u > /tmp/original_enabled.txt
+          source /tmp/modules_list.sh
+          for mod in "${MODULES_TO_ADD[@]}"; do
+            add_missing_module "$mod" "arch/arm64/configs/${{ steps.inject.outputs.defconfig }}"
+            add_missing_module "$mod" "out/.config"
+          done
+          if [ -d "drivers/net/wireless/realtek/rtl8812au" ]; then
+            add_missing_module "CONFIG_88XXAU" "out/.config"
+          fi
+          make "${MAKE_ARGS[@]}" olddefconfig
+          for mod in "${MODULES_TO_ADD[@]}"; do
+            add_missing_module "$mod" "out/.config"
+          done
+          if [ -d "drivers/net/wireless/realtek/rtl8812au" ]; then
+            add_missing_module "CONFIG_88XXAU" "out/.config"
+          fi
+          while IFS= read -r line; do
+            cfg_name="${line%%=*}"
+            if ! grep -q "^${line}$" out/.config; then
+              if grep -qE "^(${cfg_name}=|# ${cfg_name} is not set)" out/.config; then
+                sed -i "s|^${cfg_name}=.*|${line}|; s|^# ${cfg_name} is not set|${line}|" out/.config
+              else
+                echo "${line}" >> out/.config
+              fi
+            fi
+          done < /tmp/original_enabled.txt
+          make "${MAKE_ARGS[@]}" olddefconfig
+
+      - name: 7. Compile Kernel
+        working-directory: kernel
+        run: |
+          if [ -d "$HOME/clang/bin" ]; then
+            export PATH="$HOME/clang/bin:$PATH"
+          fi
+          MAKE_ARGS=(O=out ARCH=arm64 SUBARCH=arm64 CC=clang HOSTCC=clang HOSTCXX=clang++ LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- CROSS_COMPILE_COMPAT=arm-linux-gnueabi- LLVM=1 LLVM_IAS=1 KCFLAGS="-Wno-error")
+          if ! make -j$(nproc --all) "${MAKE_ARGS[@]}"; then
+            if [ -d "drivers/net/wireless/realtek/rtl8812au" ]; then
+              rm -rf drivers/net/wireless/realtek/rtl8812au
+              cp /tmp/realtek_Makefile.bak drivers/net/wireless/realtek/Makefile
+              cp /tmp/realtek_Kconfig.bak drivers/net/wireless/realtek/Kconfig
+              sed -i '/CONFIG_88XXAU/d' out/.config
+              make "${MAKE_ARGS[@]}" olddefconfig
+              make -j$(nproc --all) "${MAKE_ARGS[@]}"
+            else
+              exit 1
+            fi
+          fi
+
+      - name: 8. Package Flashable AnyKernel3 Zip
+        working-directory: kernel
+        run: |
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
+          rm -rf AnyKernel3/.git AnyKernel3/modules AnyKernel3/patch AnyKernel3/ramdisk
+          printf '%s\n' "# AnyKernel3 Ramdisk Mod Script" "properties() { '" "kernel.string=Calamity Caly-Tachyon (USB-ACM + Ext-WiFi)" "do.devicecheck=1" "do.modules=0" "do.systemless=1" "do.cleanup=1" "do.cleanuponabort=0" "device.name1=spacewar" "device.name2=Spacewar" "device.name3=Nothing Phone (1)" "supported.versions=14-16" "'; }" "block=/dev/block/bootdevice/by-name/boot;" "is_slot_device=1;" "ramdisk_compression=auto;" "patch_vbmeta_flag=auto;" ". tools/ak3-core.sh;" "split_boot;" "flash_boot;" > AnyKernel3/anykernel.sh
+          if [ -f "out/arch/arm64/boot/Image.gz" ]; then
+            cp out/arch/arm64/boot/Image.gz AnyKernel3/
+          elif [ -f "out/arch/arm64/boot/Image" ]; then
+            cp out/arch/arm64/boot/Image AnyKernel3/
+          else
+            exit 1
+          fi
+          if compgen -G "out/arch/arm64/boot/dts/vendor/qcom/*.dtb" > /dev/null; then
+            cat out/arch/arm64/boot/dts/vendor/qcom/*.dtb > AnyKernel3/dtb
+          fi
+          if [ -f "out/arch/arm64/boot/dtbo.img" ]; then
+            cp out/arch/arm64/boot/dtbo.img AnyKernel3/
+          fi
+          cd AnyKernel3
+          ZIP_NAME="Calamity-Tachyon-Spacewar-USB_WiFi-$(date +%Y%m%d).zip"
+          zip -r9 "../$ZIP_NAME" * -x .git README.md *placeholder
+          cd ..
+          mkdir -p artifacts
+          mv "$ZIP_NAME" artifacts/
+          cp out/.config artifacts/final_kernel.config
+          cp /tmp/defconfig.diff artifacts/defconfig.diff || true
+
+      - name: 9. Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Calamity-Spacewar-Flashable-Kernel
+          path: kernel/artifacts/*
+          

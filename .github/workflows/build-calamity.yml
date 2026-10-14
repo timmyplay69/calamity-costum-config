@@ -21,25 +21,23 @@ jobs:
             rm -f clang.tar.gz
           fi
 
-      - name: 3. Clone Source Calamity (Safe Submodule Purge)
+      - name: 3. Clone Source Calamity & Fix KernelSU Submodule
         env:
           GH_TOKEN: ${{ secrets.MY_GITHUB_TOKEN }}
         run: |
           if [ -n "$GH_TOKEN" ]; then
             git config --global url."https://${GH_TOKEN}@github.com/".insteadOf "https://github.com/"
           fi
-          # Jangan pakai --recurse-submodules di awal agar tidak langsung error di zerofrip
+          
+          # Clone repo utama
           git clone --depth=1 https://github.com/BruxinCore/CalamityKernel-spacewar.git kernel
           cd kernel
           
-          # Hapus total konfigurasi submodule KernelSU-Next yang sudah mati/tidak ditemukan
-          git submodule deinit -f KernelSU-Next || true
-          rm -rf .git/modules/KernelSU-Next KernelSU-Next || true
-          if [ -f .gitmodules ]; then
-            git config -f .gitmodules --remove-section submodule.KernelSU-Next || true
-          fi
+          # Jika url submodule KernelSU-Next mengarah ke akun yang mati/privat, 
+          # kita ganti URL submodule-nya ke repo KernelSU-Next resmi yang aktif secara publik
+          git submodule set-url KernelSU-Next https://github.com/rsuntk/KernelSU-Next.git || true
           
-          # Update submodule lain yang masih aktif jika ada
+          # Inisialisasi submodule dengan mulus tanpa error
           git submodule update --init --recursive || true
 
       - name: 4. Deteksi Defconfig dan Tambah Modul Baru
